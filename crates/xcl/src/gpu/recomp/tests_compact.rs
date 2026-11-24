@@ -179,12 +179,13 @@ impl Dispatch {
         };
         let n: usize = after("        if (xcl_nb >= ", "u) break;").parse().unwrap();
         // switch ((XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask}u), or packed
-        // across words: uint xcl_p = xcl_b * {bits}u; switch (((XCL_BT[xcl_p >> 5u] >> …
+        // across words: uint xcl_p = xcl_b * {bits}u; switch (((XCL_BT[xcl_p >> 5u] >> …; nested
+        // (`XCL_COMPACT_NEST`): uint xcl_c = <the same selector>; switch (xcl_c >> …) in groups
         let dense = h.contains("        uint xcl_p = xcl_b * ");
         let (per, bits): (usize, u32) = if dense {
             (0, after("        uint xcl_p = xcl_b * ", "u;").parse().unwrap())
         } else {
-            let per = after("switch ((XCL_BT[xcl_b / ", "u]").parse().unwrap();
+            let per = after("(XCL_BT[xcl_b / ", "u]").parse().unwrap();
             (per, after(&format!("(xcl_b % {per}u * "), "u))").parse().unwrap())
         };
         let table = after("static const uint XCL_BT[", "};");
@@ -208,9 +209,18 @@ impl Dispatch {
             .collect();
         let mut cases: Vec<(u64, String)> = Vec::new();
         let mut open = false;
-        let switch = h.find(if dense { "switch (((XCL_BT[" } else { "switch ((XCL_BT[" }).unwrap();
+        let nested = h.contains("        uint xcl_c = ");
+        let switch = h.find(if nested { "        uint xcl_c = " } else if dense { "switch (((XCL_BT[" } else { "switch ((XCL_BT[" }).unwrap();
         for l in h[switch..].lines().skip(1) {
-            if let Some(rest) = l.strip_prefix("        case ") {
+            if nested && (l.ends_with(": switch (xcl_c) {") || l.starts_with("        } xcl_nb = min(") || l.starts_with("        switch (xcl_c >> ")) {
+                continue;
+            } else if nested && l.starts_with("        default:") {
+                // each group ends with one; the loop's own default follows the last group
+                if h[switch..].contains(&format!("        case {}u: {{", cases.len())) {
+                    continue;
+                }
+                break;
+            } else if let Some(rest) = l.strip_prefix("        case ") {
                 let (k, pc) = rest.split_once("u: { // ").unwrap_or_else(|| panic!("case line {l:?}"));
                 assert_eq!(k.parse::<usize>().unwrap(), cases.len(), "cases in order");
                 cases.push((u64::from_str_radix(pc, 16).unwrap(), String::new()));
@@ -1022,6 +1032,29 @@ fn gpu_compact_dense_table() {
     println!("{straddled} blocks' cases straddle a word");
 }
 
+/// The two-level dispatch (`compact::compact_with` with groups of 2 and 4 cases, every
+/// instruction a block of its own) runs as `translate` does, in every form of this adapter.
+#[test]
+fn gpu_compact_nested_dispatch() {
+    if !gpu_ready() {
+        return;
+    }
+    let inputs = Inputs::lanes(Vec::new()).vgpr(1, |l| hash(l, 1)).vgpr(2, |l| hash(l, 2)).vgpr(3, |l| hash(l, 3) | 1).vgpr(6, |l| hash(l, 6));
+    let programs = [("shared targets", shared_targets()), ("many targets", many_targets()), ("repeated blocks", repeated_blocks()), ("execz nest", execz_nest()), ("backward loops", backward_loops())];
+    for (what, code) in programs {
+        for (form, opt) in forms(true) {
+            let want = ran(&translate(&code, &opt).unwrap(), "translate", &inputs);
+            for p in [2, 4] {
+                let t = compact::compact_with(&code, &opt, 0, usize::MAX, p).unwrap_or_else(|e| panic!("{what} ({form}): {e}"));
+                assert!(t.hlsl.contains("switch (xcl_c >> "), "{what} ({form}): not nested");
+                let got = ran(&t, "compact, nested", &inputs);
+                let diff = differences(&want, &got, slot);
+                assert!(diff.is_empty(), "{what} ({form}), groups of {p}: translate / nested differ:\n{}", diff.join("\n"));
+            }
+        }
+    }
+}
+
 #[test]
 fn gpu_compact_repeated_blocks() {
     if !gpu_ready() {
@@ -1422,4 +1455,39 @@ fn gpu_compact_sample_big_cs() {
     };
     let d = differences(a, b, slot);
     assert!(d.is_empty(), "big CS: translate / translate_compact differ:\n{}", d.join("\n"));
+}
+
+/// `XCL_SAMPLE_BIG_CS=<file>`: DXC does not fold the two-level dispatch (groups of 32 cases)
+/// back: its DXIL is under 80 % of the flat compact form's (folded back it is about 100 %).
+/// Measured with `xcl shaders --precompile`: 36 % for ActivateRays (2,848,780 -> 1,037,876 B),
+/// 64 % for two other programs (942,812 -> 602,444 and 847,392 -> 539,260 B). Only DXC is
+/// needed, no GPU. The results of the two forms are compared on the synthetic programs
+/// (`gpu_compact_nested_dispatch`): a sample's own dispatch does not finish in the runner's
+/// 10 s with zero inputs, flat or nested. Does nothing when the variable is unset.
+#[test]
+fn compact_sample_big_cs_nested_dxil() {
+    let Some(path) = std::env::var_os("XCL_SAMPLE_BIG_CS") else { return };
+    if super::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    let code = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", std::path::Path::new(&path).display()));
+    let wave64 = super::detect_wave64(&code);
+    let opt = Options { wave64, split_wave64: wave64 && runner::split_wave64(), ..Default::default() };
+    let mut len = Vec::new();
+    for (nest, what) in [(0, "flat"), (32, "nested")] {
+        let t = match compact::compact_with(&code, &opt, 600, 8192, nest) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED compact_sample_big_cs_nested_dxil: compact form refused: {e}");
+                return;
+            }
+        };
+        let t1 = std::time::Instant::now();
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{what}: DXC: {e}"));
+        eprintln!("big CS {what}: HLSL {} bytes, DXIL {} bytes in {:.1} s", t.hlsl.len(), dxil.len(), t1.elapsed().as_secs_f64());
+        len.push(dxil.len());
+    }
+    eprintln!("big CS nested DXIL: {:.0} % of the flat form's", 100.0 * len[1] as f64 / len[0] as f64);
+    assert!(len[1] * 10 < len[0] * 8, "big CS: nested DXIL {} B is not under 80 % of the flat {} B", len[1], len[0]);
 }
