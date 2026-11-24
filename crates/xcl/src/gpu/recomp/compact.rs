@@ -165,7 +165,7 @@ fn compact(code: &[u8], opt: &Options, heavy: usize) -> Result<Translation, Stri
     }
     let Prepared { insts, leaders, branches, mut em, .. } = prepare(code, opt)?;
     if branches == 0 {
-        return super::translate(code, opt);
+        return super::translate_inner(code, opt);
     }
     let list = blocks(&insts, &leaders, &mut em, heavy)?;
     let n = list.len();
