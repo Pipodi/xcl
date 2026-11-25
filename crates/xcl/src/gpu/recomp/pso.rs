@@ -265,6 +265,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
 pub(crate) fn translation_cache_identity() -> u64 { translated::identity() }
 
 mod translated {
+    use super::super::compact::Nest;
     use super::{Compiled, Stage};
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
@@ -375,12 +376,14 @@ mod translated {
     }
 
     /// `_c` for a program that went to the compact backend (`CompactCs`), then `_n<P>` when it
-    /// switches in two levels (`XCL_COMPACT_NEST`); nothing otherwise.
-    pub(super) fn compact_tag(compact: bool, nest: usize) -> String {
+    /// switches in two levels (`XCL_COMPACT_NEST`), `_na` for `auto` (the group size then follows
+    /// from the program); nothing otherwise.
+    pub(super) fn compact_tag(compact: bool, nest: Nest) -> String {
         match (compact, nest) {
             (false, _) => String::new(),
-            (true, 0) => "_c".to_string(),
-            (true, n) => format!("_c_n{n}"),
+            (true, Nest::Flat) => "_c".to_string(),
+            (true, Nest::Groups(n)) => format!("_c_n{n}"),
+            (true, Nest::Auto) => "_c_na".to_string(),
         }
     }
 
@@ -2168,9 +2171,11 @@ mod shader_cache_tests {
         let normal = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false);
         assert_eq!(normal.file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0.bin", crate::gpu::shader::fnv64(blob)));
         assert_eq!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, true).file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0{}.bin", crate::gpu::shader::fnv64(blob), translated::compact_tag(true, super::super::compact::nest_from_env())));
-        assert_eq!(translated::compact_tag(true, 0), "_c");
-        assert_eq!(translated::compact_tag(true, 32), "_c_n32");
-        assert_eq!(translated::compact_tag(false, 32), "");
+        use super::super::compact::Nest;
+        assert_eq!(translated::compact_tag(true, Nest::Flat), "_c");
+        assert_eq!(translated::compact_tag(true, Nest::Groups(32)), "_c_n32");
+        assert_eq!(translated::compact_tag(true, Nest::Auto), "_c_na");
+        assert_eq!(translated::compact_tag(false, Nest::Groups(32)), "");
         let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || Ok(compiled(1))).unwrap();
         let compact = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || Ok(compiled(2))).unwrap();
         assert_eq!((first.dxil[67], compact.dxil[67]), (1, 2), "the compact form did not reuse the normal entry");

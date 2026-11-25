@@ -161,16 +161,34 @@ fn blocks(insts: &[rdna2::Decoded], leaders: &BTreeSet<u64>, em: &mut emit::Em, 
     Ok(out)
 }
 
+/// The setting of `XCL_COMPACT_NEST`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Nest {
+    /// One switch over all cases.
+    Flat,
+    /// Groups of this many cases (a power of two up to `MAX_NEST`).
+    Groups(usize),
+    /// `AUTO_GROUP` cases per group for a program of `NEST_MIN_CASES` cases or more, flat below.
+    Auto,
+}
+
+impl From<usize> for Nest {
+    fn from(p: usize) -> Nest {
+        if p == 0 { Nest::Flat } else { Nest::Groups(p) }
+    }
+}
+
 /// `XCL_COMPACT_NEST=<P>`: the dispatch loop switches in two levels, on `case >> log2(P)` and
 /// then inside the group of P cases (`compact_with`). A power of two up to `MAX_NEST`; unset or
-/// `0`: one switch over all cases. Anything else warns and leaves it off. Read once.
-pub(super) fn nest_from_env() -> usize {
-    static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// `0`: one switch over all cases; `auto`: groups of `AUTO_GROUP` from `NEST_MIN_CASES` cases
+/// on, one switch below. Anything else warns and leaves it off. Read once.
+pub(super) fn nest_from_env() -> Nest {
+    static S: std::sync::OnceLock<Nest> = std::sync::OnceLock::new();
     *S.get_or_init(|| {
-        let Ok(v) = std::env::var("XCL_COMPACT_NEST") else { return 0 };
+        let Ok(v) = std::env::var("XCL_COMPACT_NEST") else { return Nest::Flat };
         parse_nest(&v).unwrap_or_else(|| {
-            crate::xlog_warn!("[SHADER] XCL_COMPACT_NEST={v:?} is not 0 or a power of two up to {MAX_NEST} – off");
-            0
+            crate::xlog_warn!("[SHADER] XCL_COMPACT_NEST={v:?} is not 0, auto or a power of two up to {MAX_NEST} – off");
+            Nest::Flat
         })
     })
 }
@@ -179,20 +197,49 @@ pub(super) fn nest_from_env() -> usize {
 /// by HLSL to a shift of 0.
 const MAX_NEST: usize = 1 << 16;
 
-fn parse_nest(v: &str) -> Option<usize> {
-    v.trim().parse::<usize>().ok().filter(|&p| p == 0 || (p.is_power_of_two() && p <= MAX_NEST))
+/// `XCL_COMPACT_NEST=auto` nests programs of at least this many cases (distinct texts). Measured
+/// on an RTX 4090 with a cold driver: 751 cases 11.6 s flat, 5.9 s nested; 698 cases 9.5 s, 4.8 s;
+/// 2,516 cases 168 s, 36 s. Groups of 16, 32 and 64 tie. 512 is below the smallest program
+/// measured; on RADV the ~700-case ones built up to 28 % slower nested.
+const NEST_MIN_CASES: usize = 512;
+
+/// The group size of `Nest::Auto`.
+const AUTO_GROUP: usize = 32;
+
+fn parse_nest(v: &str) -> Option<Nest> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") {
+        return Some(Nest::Auto);
+    }
+    v.parse::<usize>().ok().filter(|&p| p == 0 || (p.is_power_of_two() && p <= MAX_NEST)).map(Nest::from)
+}
+
+/// The group size (0 = flat) for a program of `cases` cases.
+fn resolve_nest(nest: Nest, cases: usize, min_cases: usize) -> usize {
+    match nest {
+        Nest::Flat => 0,
+        Nest::Groups(p) => p,
+        Nest::Auto if cases >= min_cases => AUTO_GROUP,
+        Nest::Auto => 0,
+    }
 }
 
 /// `translate_compact` with the bound `heavy` (`HEAVY`); a table of more than `dense_above`
 /// words is packed across words.
 pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usize) -> Result<Translation, String> {
-    compact_with(code, opt, heavy, dense_above, nest_from_env())
+    compact_at(code, opt, heavy, dense_above, nest_from_env(), NEST_MIN_CASES)
 }
 
-/// `compact` with the group size of the two-level dispatch given (`nest_from_env`; 0 = flat).
+/// `compact` with the group size of the two-level dispatch given (0 = flat).
 /// DXC folds the groups' exits back into one merge block with a phi operand per case unless
 /// each group ends in `xcl_nb = min(xcl_nb, n)`, which it cannot see through.
 pub(super) fn compact_with(code: &[u8], opt: &Options, heavy: usize, dense_above: usize, nest: usize) -> Result<Translation, String> {
+    compact_at(code, opt, heavy, dense_above, Nest::from(nest), NEST_MIN_CASES)
+}
+
+/// `compact_with` with the setting (`nest_from_env`): `Nest::Auto` is resolved once the cases
+/// are counted, nesting from `min_cases` cases on.
+fn compact_at(code: &[u8], opt: &Options, heavy: usize, dense_above: usize, nest: Nest, min_cases: usize) -> Result<Translation, String> {
     if matches!(opt.mode, Mode::Geometry(_)) {
         return Err("compact form: geometry programs are not supported".into());
     }
@@ -287,6 +334,7 @@ pub(super) fn compact_with(code: &[u8], opt: &Options, heavy: usize, dense_above
     } else {
         format!("(XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask:#x}u")
     };
+    let nest = resolve_nest(nest, texts.len(), min_cases);
     if nest > 0 {
         let _ = writeln!(body, "        uint xcl_c = {selector};");
         let _ = writeln!(body, "        switch (xcl_c >> {}u) {{", nest.trailing_zeros());
@@ -436,9 +484,26 @@ mod tests {
 
     #[test]
     fn the_nest_size_is_zero_or_a_power_of_two_up_to_the_limit() {
-        for (v, want) in [("0", Some(0)), ("1", Some(1)), (" 32 ", Some(32)), ("65536", Some(65536)), ("131072", None), ("4294967296", None), ("48", None), ("-1", None), ("x", None), ("", None)] {
+        let g = |p| Some(Nest::Groups(p));
+        for (v, want) in [("0", Some(Nest::Flat)), ("1", g(1)), (" 32 ", g(32)), ("65536", g(65536)), ("auto", Some(Nest::Auto)), (" AUTO ", Some(Nest::Auto)), ("131072", None), ("4294967296", None), ("48", None), ("-1", None), ("x", None), ("", None)] {
             assert_eq!(parse_nest(v), want, "{v:?}");
         }
+    }
+
+    #[test]
+    fn auto_nest_starts_at_the_case_threshold() {
+        assert_eq!(NEST_MIN_CASES, 512);
+        assert_eq!([(0, Nest::Auto), (511, Nest::Auto), (512, Nest::Auto), (9000, Nest::Auto)].map(|(n, s)| resolve_nest(s, n, NEST_MIN_CASES)), [0, 0, AUTO_GROUP, AUTO_GROUP]);
+        assert_eq!((resolve_nest(Nest::Flat, 9000, 512), resolve_nest(Nest::Groups(4), 1, 512)), (0, 4));
+        let code = guarded();
+        let opt = Options::default();
+        let cases = compact_with(&code, &opt, 0, MAX_TABLE_WORDS, 0).unwrap().hlsl.matches("u: { // ").count();
+        let at = compact_at(&code, &opt, 0, MAX_TABLE_WORDS, Nest::Auto, cases).unwrap();
+        assert!(at.hlsl.contains(&format!("switch (xcl_c >> {}u) {{", AUTO_GROUP.trailing_zeros())) && at.hlsl.matches("u: switch (xcl_c) {").count() == cases.div_ceil(AUTO_GROUP), "{}", at.hlsl);
+        let below = compact_at(&code, &opt, 0, MAX_TABLE_WORDS, Nest::Auto, cases + 1).unwrap();
+        assert!(!below.hlsl.contains("xcl_c") && below.hlsl.contains("        switch ((XCL_BT[xcl_b / "), "{}", below.hlsl);
+        let flat = compact_with(&code, &opt, 0, MAX_TABLE_WORDS, 0).unwrap();
+        assert_eq!(below.hlsl, flat.hlsl);
     }
 
     #[test]
