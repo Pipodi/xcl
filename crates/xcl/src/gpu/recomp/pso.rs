@@ -376,8 +376,8 @@ mod translated {
     }
 
     /// `_c` for a program that went to the compact backend (`CompactCs`), then `_n<P>` when it
-    /// switches in two levels (`XCL_COMPACT_NEST`), `_na` for `auto` (the group size then follows
-    /// from the program); nothing otherwise.
+    /// switches in two levels (`XCL_COMPACT_NEST`), `_na` for `auto` and unset (the group size
+    /// then follows from the program); nothing otherwise.
     pub(super) fn compact_tag(compact: bool, nest: Nest) -> String {
         match (compact, nest) {
             (false, _) => String::new(),

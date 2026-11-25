@@ -179,17 +179,20 @@ impl From<usize> for Nest {
 }
 
 /// `XCL_COMPACT_NEST=<P>`: the dispatch loop switches in two levels, on `case >> log2(P)` and
-/// then inside the group of P cases (`compact_with`). A power of two up to `MAX_NEST`; unset or
-/// `0`: one switch over all cases; `auto`: groups of `AUTO_GROUP` from `NEST_MIN_CASES` cases
-/// on, one switch below. Anything else warns and leaves it off. Read once.
+/// then inside the group of P cases (`compact_with`). A power of two up to `MAX_NEST`; `0`: one
+/// switch over all cases; unset or `auto`: groups of `AUTO_GROUP` from `NEST_MIN_CASES` cases
+/// on, one switch below. Anything else warns and keeps `auto`. Read once.
 pub(super) fn nest_from_env() -> Nest {
     static S: std::sync::OnceLock<Nest> = std::sync::OnceLock::new();
-    *S.get_or_init(|| {
-        let Ok(v) = std::env::var("XCL_COMPACT_NEST") else { return Nest::Flat };
-        parse_nest(&v).unwrap_or_else(|| {
-            crate::xlog_warn!("[SHADER] XCL_COMPACT_NEST={v:?} is not 0, auto or a power of two up to {MAX_NEST} – off");
-            Nest::Flat
-        })
+    *S.get_or_init(|| nest_of(std::env::var("XCL_COMPACT_NEST").ok().as_deref()))
+}
+
+/// The setting for a value of `XCL_COMPACT_NEST` (`None`: unset).
+fn nest_of(v: Option<&str>) -> Nest {
+    let Some(v) = v else { return Nest::Auto };
+    parse_nest(v).unwrap_or_else(|| {
+        crate::xlog_warn!("[SHADER] XCL_COMPACT_NEST={v:?} is not 0, auto or a power of two up to {MAX_NEST} – auto");
+        Nest::Auto
     })
 }
 
@@ -488,6 +491,11 @@ mod tests {
         for (v, want) in [("0", Some(Nest::Flat)), ("1", g(1)), (" 32 ", g(32)), ("65536", g(65536)), ("auto", Some(Nest::Auto)), (" AUTO ", Some(Nest::Auto)), ("131072", None), ("4294967296", None), ("48", None), ("-1", None), ("x", None), ("", None)] {
             assert_eq!(parse_nest(v), want, "{v:?}");
         }
+    }
+
+    #[test]
+    fn an_unset_nest_is_auto() {
+        assert_eq!([None, Some("auto"), Some("0"), Some("32"), Some("48")].map(nest_of), [Nest::Auto, Nest::Auto, Nest::Flat, Nest::Groups(32), Nest::Auto]);
     }
 
     #[test]

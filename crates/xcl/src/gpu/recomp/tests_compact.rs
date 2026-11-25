@@ -1399,6 +1399,7 @@ fn gpu_compact_against_the_pc_block_fallback() {
 /// `XCL_SAMPLE_BIG_CS=<file>`: a retail program's code (e.g. 56c0cd3b82a00c6e, 488 744 bytes),
 /// run as a kernel through both backends: v0 = lane index, the code as memory from address 0
 /// plus 64 KiB of zeros, every other input 0. Does nothing when the variable is unset.
+/// The compact form is the default one (`XCL_COMPACT_NEST`): nested for 512 cases or more.
 /// DXC takes minutes on programs this size. A program the compact form refuses (e.g. its table
 /// limit) is SKIPPED; when the driver cannot create `translate`'s pipeline (e.g. E_OUTOFMEMORY),
 /// the A/B comparison is SKIPPED and the compact form must still compile and run.
