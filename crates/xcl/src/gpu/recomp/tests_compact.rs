@@ -1491,3 +1491,143 @@ fn compact_sample_big_cs_nested_dxil() {
     eprintln!("big CS nested DXIL: {:.0} % of the flat form's", 100.0 * len[1] as f64 / len[0] as f64);
     assert!(len[1] * 10 < len[0] * 8, "big CS: nested DXIL {} B is not under 80 % of the flat {} B", len[1], len[0]);
 }
+
+/// The cases of a dispatch switch from line `*i` of `lines` on, up to the first line that is
+/// not a case: `        case {k}u: { // {pc}`, its text, `        } break;`. Each is (number,
+/// address, text).
+fn dispatch_cases<'a>(lines: &[&'a str], i: &mut usize) -> Result<Vec<(usize, &'a str, Vec<&'a str>)>, String> {
+    let mut cases = Vec::new();
+    while let Some((k, pc)) = lines.get(*i).and_then(|l| l.strip_prefix("        case ")).and_then(|l| l.split_once("u: { // ")) {
+        let k: usize = k.parse().map_err(|_| format!("line {}: case number {k:?}", *i + 1))?;
+        let start = *i + 1;
+        let len = lines[start..].iter().position(|&l| l == "        } break;").ok_or_else(|| format!("case {k}: no end"))?;
+        cases.push((k, pc, lines[start..start + len].to_vec()));
+        *i = start + len + 1;
+    }
+    Ok(cases)
+}
+
+/// Checks that the two-level dispatch in `nested` (groups of `p`) runs what the flat one in
+/// `flat` runs, for every block:
+/// - the text before the switch (the table, the loop head) and after it is the same;
+/// - the case number `xcl_c` is the flat switch's expression of the table;
+/// - case `k` sits in group `k >> log2(p)`, with the flat case's address and text;
+/// - every group ends in `xcl_nb = min(xcl_nb, n)` with the loop's own `n`.
+///
+/// The `min` changes only an `xcl_nb` of `n` or more, which ends the loop either way
+/// (`if (xcl_nb >= n) break;`), and `xcl_nb` is declared in the loop. A case number past the
+/// last case reaches a default in both forms. Returns the number of cases.
+fn nested_matches_flat(flat: &str, nested: &str, p: usize) -> Result<usize, String> {
+    const TAIL: &str = "        default: xcl_nb = 0xFFFFFFFFu; break;\n        }\n";
+    let at = flat.find("        switch (").ok_or("flat: no switch")?;
+    let line = &flat[at..at + flat[at..].find('\n').ok_or("flat: switch line")? + 1];
+    let selector = line.strip_prefix("        switch (").and_then(|l| l.strip_suffix(") {\n")).ok_or("flat: switch line")?;
+    let nat = nested.find("        uint xcl_c = ").ok_or("nested: no xcl_c")?;
+    if flat[..at] != nested[..nat] {
+        return Err("the text before the dispatch differs".into());
+    }
+    let head = format!("        uint xcl_c = {selector};\n        switch (xcl_c >> {}u) {{\n", p.trailing_zeros());
+    if !nested[nat..].starts_with(&head) {
+        return Err(format!("nested: the case number is not the flat switch's {selector:?} in groups of {p}"));
+    }
+    let (fend, nend) = (flat.rfind(TAIL).ok_or("flat: no default")?, nested.rfind(TAIL).ok_or("nested: no default")?);
+    if flat[fend..] != nested[nend..] {
+        return Err("the text after the dispatch differs".into());
+    }
+    let tail = &flat[fend..];
+    let b = tail.find("if (xcl_nb >= ").ok_or("no loop bound")? + "if (xcl_nb >= ".len();
+    let n = &tail[b..b + tail[b..].find("u)").ok_or("loop bound")?];
+    let fl: Vec<&str> = flat[at + line.len()..fend].lines().collect();
+    let mut i = 0;
+    let want = dispatch_cases(&fl, &mut i)?;
+    if i != fl.len() {
+        return Err(format!("flat: line {:?} between the cases", fl[i]));
+    }
+    let nl: Vec<&str> = nested[nat + head.len()..nend].lines().collect();
+    let (mut i, mut g, mut got) = (0, 0usize, Vec::new());
+    let end = ["        default: xcl_nb = 0xFFFFFFFFu; break;".to_string(), format!("        }} xcl_nb = min(xcl_nb, {n}u); break;")];
+    while i < nl.len() {
+        if nl[i] != format!("        case {g}u: switch (xcl_c) {{") {
+            return Err(format!("nested: group {g} starts with {:?}", nl[i]));
+        }
+        i += 1;
+        let cases = dispatch_cases(&nl, &mut i)?;
+        if let Some((k, ..)) = cases.iter().find(|c| c.0 / p != g) {
+            return Err(format!("nested: case {k} in group {g}"));
+        }
+        if nl.get(i..i + 2) != Some(&[end[0].as_str(), end[1].as_str()][..]) {
+            return Err(format!("nested: group {g} ends with {:?}", nl.get(i..(i + 2).min(nl.len()))));
+        }
+        i += 2;
+        got.extend(cases);
+        g += 1;
+    }
+    if got != want {
+        let k = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
+        return Err(format!("case {k} differs ({} nested cases, {} flat)", got.len(), want.len()));
+    }
+    Ok(want.len())
+}
+
+/// `nested_matches_flat` on the synthetic programs, in every group size and both table
+/// packings; and it finds a case moved to another group, a case's text changed, and a group's
+/// bound changed.
+#[test]
+fn nested_dispatch_runs_the_flat_cases() {
+    let programs = [("shared targets", shared_targets()), ("many targets", many_targets()), ("repeated blocks", repeated_blocks()), ("execz nest", execz_nest()), ("backward loops", backward_loops())];
+    let opt = Options::default();
+    for (what, code) in &programs {
+        for dense in [usize::MAX, 0] {
+            let flat = compact::compact_with(code, &opt, 0, dense, 0).unwrap();
+            for p in [1, 2, 4, 8, 16, 32] {
+                let t = compact::compact_with(code, &opt, 0, dense, p).unwrap();
+                let cases = nested_matches_flat(&flat.hlsl, &t.hlsl, p).unwrap_or_else(|e| panic!("{what}, groups of {p}, dense {}: {e}", dense == 0));
+                assert_eq!(cases, flat.blocks, "{what}");
+            }
+        }
+    }
+    let code = many_targets();
+    let flat = compact::compact_with(&code, &opt, 0, usize::MAX, 0).unwrap().hlsl;
+    let t = compact::compact_with(&code, &opt, 0, usize::MAX, 2).unwrap().hlsl;
+    assert_eq!(nested_matches_flat(&flat, &t, 2), Ok(flat.matches("u: { // ").count()));
+    // cases 1 and 2 swap numbers: 2 is then in group 0
+    let moved = t.replacen("        case 1u: {", "        case X: {", 1).replacen("        case 2u: {", "        case 1u: {", 1).replacen("        case X: {", "        case 2u: {", 1);
+    assert_eq!(nested_matches_flat(&flat, &moved, 2), Err("nested: case 2 in group 0".into()));
+    let at = t.find("        case 1u: {").unwrap();
+    let at = at + t[at..].find('\n').unwrap() + 1;
+    let changed = format!("{}            xcl_nb = 0u;\n{}", &t[..at], &t[at..]);
+    assert!(nested_matches_flat(&flat, &changed, 2).unwrap_err().starts_with("case 1 differs"), "changed");
+    let bound = t.replacen("xcl_nb = min(xcl_nb, ", "xcl_nb = min(xcl_nb, 1u + ", 1);
+    assert!(nested_matches_flat(&flat, &bound, 2).unwrap_err().starts_with("nested: group 0 ends with"), "bound");
+    assert!(nested_matches_flat(&flat, &t, 4).is_err(), "another group size");
+}
+
+/// `XCL_SAMPLE_BIG_CS=<file>`: the two-level dispatch of a retail program runs the flat one's
+/// cases for every block (`nested_matches_flat`), in groups of 16, 32 and 64, with both table
+/// packings. The two forms' results cannot be compared on the GPU for these programs: run as a
+/// kernel with zero or random inputs, a retail program does not finish or removes the device,
+/// flat or nested (#1269). CPU only. Does nothing when the variable is unset.
+#[test]
+fn compact_sample_big_cs_nested_runs_the_flat_cases() {
+    let Some(path) = std::env::var_os("XCL_SAMPLE_BIG_CS") else { return };
+    let code = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", std::path::Path::new(&path).display()));
+    let wave64 = super::detect_wave64(&code);
+    for split_wave64 in if wave64 { vec![false, true] } else { vec![false] } {
+        let opt = Options { wave64, split_wave64, ..Default::default() };
+        for dense in [8192, 0] {
+            let flat = match compact::compact_with(&code, &opt, 600, dense, 0) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("SKIPPED compact_sample_big_cs_nested_runs_the_flat_cases: compact form refused: {e}");
+                    return;
+                }
+            };
+            for p in [16, 32, 64] {
+                let t = compact::compact_with(&code, &opt, 600, dense, p).unwrap_or_else(|e| panic!("groups of {p}: {e}"));
+                let cases = nested_matches_flat(&flat.hlsl, &t.hlsl, p).unwrap_or_else(|e| panic!("big CS, groups of {p}, split {split_wave64}, dense {}: {e}", dense == 0));
+                assert_eq!(cases, flat.blocks, "big CS, groups of {p}");
+                eprintln!("big CS: {cases} cases, groups of {p}, wave64 {wave64}, split {split_wave64}, dense {}: the nested dispatch runs the flat cases", dense == 0);
+            }
+        }
+    }
+}
